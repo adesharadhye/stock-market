@@ -1,0 +1,388 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Stock Watch</title>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    :root { color-scheme: dark; }
+    body { margin: 0; font-family: Arial, sans-serif; background: #07111f; color: #f4f7fb; }
+    .app { max-width: 1200px; margin: 0 auto; padding: 24px; }
+    .hero { display: flex; justify-content: space-between; align-items: center; gap: 16px; margin-bottom: 24px; }
+    .card { background: #111c2d; border: 1px solid #233449; border-radius: 16px; padding: 16px; box-shadow: 0 10px 24px rgba(0,0,0,0.2); }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; margin-bottom: 24px; }
+    .index-card { background: linear-gradient(135deg, #18253a, #0d1726); }
+    .watchlist { display: grid; gap: 12px; }
+    .row { display: flex; justify-content: space-between; align-items: center; padding: 12px 14px; background: #0f1728; border-radius: 12px; border: 1px solid #233449; }
+    .positive { color: #22c55e; }
+    .negative { color: #ef4444; }
+    .muted { color: #8ba0b8; }
+    input { width: 100%; box-sizing: border-box; padding: 10px; border-radius: 10px; border: 1px solid #233449; background: #0b1322; color: white; margin-bottom: 12px; }
+    button { padding: 10px 14px; border: none; border-radius: 10px; background: #2563eb; color: white; cursor: pointer; }
+    .remove-btn { background: #7f1d1d; padding: 8px 10px; margin-left: 12px; }
+    .threshold-input { width: 95px; padding: 8px; border-radius: 8px; border: 1px solid #233449; background: #0b1322; color: white; margin-right: 10px; }
+    .watchlist-meta { display: flex; flex-direction: column; gap: 8px; align-items: flex-end; }
+    .suggestions { position: relative; }
+    .suggestions-list { position: absolute; top: 100%; left: 0; right: 0; background: #0f1728; border: 1px solid #233449; border-radius: 10px; margin-top: 4px; z-index: 10; overflow: hidden; }
+    .suggestion-item { padding: 10px 12px; cursor: pointer; border-bottom: 1px solid #17253b; }
+    .suggestion-item:hover { background: #16253d; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    {% verbatim %}
+    const { useEffect, useRef, useState } = React;
+    const WATCHLIST_STORAGE_KEY = 'stock-watchlist-data';
+    const REFRESH_INTERVAL_MS = 2000;
+
+    function getSavedWatchlistData() {
+      try {
+        const saved = JSON.parse(window.localStorage.getItem(WATCHLIST_STORAGE_KEY) || 'null');
+        if (!Array.isArray(saved)) return [];
+        return saved
+          .filter(Boolean)
+          .map((entry) => {
+            if (typeof entry === 'string') {
+              return { symbol: String(entry).trim().toUpperCase(), threshold: '' };
+            }
+            return {
+              symbol: String(entry.symbol || '').trim().toUpperCase(),
+              threshold: String(entry.threshold || ''),
+            };
+          })
+          .filter((entry) => entry.symbol);
+      } catch (error) {
+        return [];
+      }
+    }
+
+    function saveWatchlistData(items) {
+      try {
+        const payload = items.map((item) => ({
+          symbol: String(item.symbol || '').trim().toUpperCase(),
+          threshold: String(item.threshold || ''),
+        }));
+        window.localStorage.setItem(WATCHLIST_STORAGE_KEY, JSON.stringify(payload));
+      } catch (error) {
+        // The watchlist still works for the current tab if browser storage is blocked.
+      }
+    }
+
+    function App() {
+      const [indices, setIndices] = useState([]);
+      const [marketOpen, setMarketOpen] = useState(true);
+      const [watchlist, setWatchlist] = useState([]);
+      const [symbolInput, setSymbolInput] = useState('');
+      const [suggestions, setSuggestions] = useState([]);
+      const watchlistRef = useRef([]);
+      const refreshingRef = useRef(false);
+
+      useEffect(() => {
+        watchlistRef.current = watchlist;
+      }, [watchlist]);
+
+      async function loadIndices() {
+        try {
+          const response = await fetch('/api/market-summary/', { cache: 'no-store' });
+          const payload = await response.json();
+          const indexData = payload.indices || [];
+          const majorIndices = indexData.filter((item) => /sensex|nifty/i.test(String(item.name || '')));
+          const hasMovement = majorIndices.some((item) => Number(item.change || 0) !== 0 || Number(item.changePercent || 0) !== 0);
+          setIndices(indexData);
+          setMarketOpen(Boolean(hasMovement));
+        } catch (error) {
+          setMarketOpen(false);
+        }
+      }
+
+      async function loadStock(symbol) {
+        const normalizedSymbol = String(symbol || '').trim().toUpperCase();
+        const fallback = {
+          symbol: normalizedSymbol,
+          name: normalizedSymbol,
+          price: 0,
+          change: 0,
+          changePercent: 0,
+          lastUpdated: null,
+          error: 'Quote unavailable',
+        };
+
+        try {
+          const response = await fetch(`/quote/${encodeURIComponent(normalizedSymbol)}/`, { cache: 'no-store' });
+          const data = await response.json();
+          const resolvedSymbol = (data.symbol || normalizedSymbol).toUpperCase();
+          return {
+            ...fallback,
+            symbol: resolvedSymbol,
+            name: resolvedSymbol,
+            price: Number(data.price || 0),
+            change: Number(data.change || 0),
+            changePercent: Number(data.changePercent || 0),
+            lastUpdated: data.lastUpdated || null,
+            error: data.error || '',
+          };
+        } catch (error) {
+          return fallback;
+        }
+      }
+
+      function sortWatchlistItems(items) {
+        return [...items].sort((a, b) => {
+          const thresholdA = parseFloat(a.threshold);
+          const thresholdB = parseFloat(b.threshold);
+          const hasThresholdA = !Number.isNaN(thresholdA);
+          const hasThresholdB = !Number.isNaN(thresholdB);
+
+          if (hasThresholdA !== hasThresholdB) return hasThresholdA ? -1 : 1;
+          if (hasThresholdA && hasThresholdB && thresholdA !== thresholdB) return thresholdB - thresholdA;
+
+          const percentA = Math.abs(Number(a.changePercent || 0));
+          const percentB = Math.abs(Number(b.changePercent || 0));
+          if (percentA !== percentB) return percentB - percentA;
+          return a.symbol.localeCompare(b.symbol);
+        });
+      }
+
+      async function refreshWatchlist(symbols, preserveExisting = false) {
+        if (!symbols.length) {
+          setWatchlist([]);
+          saveWatchlistData([]);
+          return;
+        }
+        const refreshed = await Promise.all(symbols.map((symbol) => loadStock(symbol)));
+        setWatchlist((current) => {
+          const base = preserveExisting && current.length
+            ? current.map((item) => {
+                const fresh = refreshed.find((entry) => entry.symbol === item.symbol);
+                return fresh ? { ...item, ...fresh } : item;
+              })
+            : refreshed;
+          const merged = base.map((item) => ({ ...item, threshold: item.threshold || '' }));
+          const sorted = sortWatchlistItems(merged);
+          saveWatchlistData(sorted);
+          return sorted;
+        });
+      }
+
+      async function loadWatchlist() {
+        const savedData = getSavedWatchlistData();
+        if (savedData.length) {
+          const symbols = savedData.map((item) => item.symbol);
+          const existing = savedData.map((item) => ({ ...item }));
+          const refreshed = await Promise.all(symbols.map((symbol) => loadStock(symbol)));
+          const restored = refreshed.map((item) => {
+            const savedItem = existing.find((entry) => entry.symbol === item.symbol);
+            return { ...item, threshold: savedItem ? savedItem.threshold : '' };
+          });
+          setWatchlist(sortWatchlistItems(restored));
+          saveWatchlistData(sortWatchlistItems(restored));
+          return;
+        }
+        const symbols = ['AAPL', 'MSFT', 'TSLA'];
+        await refreshWatchlist(symbols, true);
+      }
+
+      useEffect(() => {
+        async function refreshAll() {
+          if (refreshingRef.current) return;
+          refreshingRef.current = true;
+          try {
+            await loadIndices();
+            const currentSymbols = watchlistRef.current.map((item) => item.symbol);
+            if (currentSymbols.length) {
+              await refreshWatchlist(currentSymbols, true);
+            }
+          } finally {
+            refreshingRef.current = false;
+          }
+        }
+
+        loadIndices();
+        loadWatchlist();
+
+        const interval = window.setInterval(refreshAll, REFRESH_INTERVAL_MS);
+
+        return () => window.clearInterval(interval);
+      }, []);
+
+      async function handleAddStock(event) {
+        event.preventDefault();
+        const symbol = symbolInput.trim().toUpperCase();
+        if (!symbol) return;
+        const existing = watchlist.some((item) => item.symbol === symbol);
+        if (!existing) {
+          const placeholder = {
+            symbol,
+            name: symbol,
+            price: 0,
+            change: 0,
+            changePercent: 0,
+            lastUpdated: null,
+            error: 'Loading...',
+            threshold: '',
+          };
+          setWatchlist((current) => {
+            const next = [...current, placeholder];
+            saveWatchlistData(next);
+            return next;
+          });
+
+          const stock = await loadStock(symbol);
+          setWatchlist((current) => {
+            const next = current.map((item) =>
+              item.symbol === symbol && item.error === 'Loading...'
+                ? { ...item, ...stock, threshold: item.threshold || '' }
+                : item
+            );
+            saveWatchlistData(next);
+            return next;
+          });
+        }
+        setSymbolInput('');
+        setSuggestions([]);
+      }
+
+      async function handleInputChange(event) {
+        const value = event.target.value;
+        setSymbolInput(value);
+        const query = value.trim();
+        if (!query) {
+          setSuggestions([]);
+          return;
+        }
+        const response = await fetch(`/api/stock-suggestions/?query=${encodeURIComponent(query)}`, { cache: 'no-store' });
+        const data = await response.json();
+        setSuggestions(data);
+      }
+
+      function handleSelectSuggestion(item) {
+        setSymbolInput(item.symbol);
+        setSuggestions([]);
+      }
+
+      function handleRemoveStock(symbol) {
+        setWatchlist((current) => {
+          const next = current.filter((item) => item.symbol !== symbol);
+          saveWatchlistData(next);
+          return next;
+        });
+      }
+
+      function handleThresholdChange(symbol, value) {
+        setWatchlist((current) => {
+          const next = current.map((item) =>
+            item.symbol === symbol ? { ...item, threshold: value } : item
+          );
+          const sorted = sortWatchlistItems(next);
+          saveWatchlistData(sorted);
+          return sorted;
+        });
+      }
+
+      const totalThreshold = watchlist.reduce((sum, stock) => {
+        const threshold = parseFloat(stock.threshold);
+        return Number.isNaN(threshold) ? sum : sum + threshold;
+      }, 0);
+
+      return (
+        <div className="app">
+          <div className="hero">
+            <div>
+              <h1>Stock Market Dashboard</h1>
+              <p className="muted">Track major indices and your selected stocks in one place.</p>
+            </div>
+            <div className="card"><strong>Market status:</strong> <span>{marketOpen ? 'Open' : 'Closed'}</span></div>
+          </div>
+
+          <div className="grid">
+            {indices.map((item) => {
+              const cls = item.change >= 0 ? 'positive' : 'negative';
+              return (
+                <div className="card index-card" key={item.name}>
+                  <div className="muted">{item.name}</div>
+                  <h3>{item.error ? 'Unavailable' : Number(item.price || 0).toFixed(2)}</h3>
+                  <div className={cls} style={{ fontWeight: 700, fontSize: '0.95rem' }}>
+                    {item.error ? item.error : `${item.change >= 0 ? '+' : ''}${Number(item.change || 0).toFixed(2)} (${Number(item.changePercent || 0).toFixed(2)}%)`}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+
+          <div className="card">
+            <h2>Add a stock</h2>
+            <form onSubmit={handleAddStock}>
+              <div className="suggestions">
+                <input
+                  value={symbolInput}
+                  onChange={handleInputChange}
+                  placeholder="Enter symbol like RELIANCE, SBIN, AAPL, or 500325.BO"
+                />
+                {suggestions.length > 0 && (
+                  <div className="suggestions-list">
+                    {suggestions.map((item) => (
+                      <div key={item.symbol} className="suggestion-item" onClick={() => handleSelectSuggestion(item)}>
+                        <strong>{item.symbol}</strong> - {item.name}{item.exchange ? ` (${item.exchange})` : ''}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+              <button type="submit">Add stock</button>
+            </form>
+          </div>
+
+          <div className="card" style={{ marginTop: '18px' }}>
+            <h2>Your watchlist</h2>
+            <div className="watchlist">
+              {watchlist.length === 0 ? (
+                <div className="muted">No stocks added yet.</div>
+              ) : watchlist.map((stock) => {
+                const cls = stock.change >= 0 ? 'positive' : 'negative';
+                return (
+                  <div className="row" key={stock.symbol}>
+                    <div>
+                      <strong>{stock.symbol}</strong>
+                      <div className="muted">{stock.name}</div>
+                    </div>
+                    <div className="watchlist-meta">
+                      <div style={{ display: 'flex', alignItems: 'center' }}>
+                        <input
+                          className="threshold-input"
+                          type="text"
+                          value={stock.threshold || ''}
+                          onChange={(event) => handleThresholdChange(stock.symbol, event.target.value)}
+                          placeholder="%"
+                        />
+                        <div>
+                          <div>{stock.error ? 'Unavailable' : stock.price.toFixed(2)}</div>
+                          <div className={cls} style={{ fontWeight: 700, fontSize: '0.95rem' }}>
+                            {stock.error ? stock.error : `${stock.change >= 0 ? '+' : ''}${stock.change.toFixed(2)} (${stock.changePercent.toFixed(2)}%)`}
+                          </div>
+                        </div>
+                      </div>
+                      <button className="remove-btn" onClick={() => handleRemoveStock(stock.symbol)} type="button">Remove</button>
+                    </div>
+                  </div>
+                );
+              })}
+              <div className="row" style={{ justifyContent: 'flex-end', fontWeight: 700 }}>
+                <span>Total %:</span>
+                <span style={{ marginLeft: '8px' }}>{totalThreshold.toFixed(2)}%</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+    {% endverbatim %}
+  </script>
+</body>
+</html>
